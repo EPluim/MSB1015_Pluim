@@ -1,0 +1,1172 @@
+---
+title: "Machine Learning & Co-abundance network analysis of stool proteomics in IBD"
+subtitle: "MSB1015 Scientific Programming / MSB1014 Network Biology"
+author: "Erik Pluim (i6284718)"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    code_folding: show
+params:
+  seed: 013
+---
+
+```{r setup, include=FALSE}
+# Installs and loads all packages, and sets the knitting options and the random seed.
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 5, dpi = 300,
+                      fig.path = "figure/")
+set.seed(params$seed)
+
+
+cran_pkgs <- c("readxl", "dplyr", "tidyr", "ggplot2", "ggrepel", "pheatmap",
+               "protti", "dendextend", "seriation", "igraph",
+               "parsnip", "workflows", "tune", "rsample", "yardstick", "dials",
+               "recipes", "kernlab", "ranger", "pROC", "httr", "jsonlite")
+bioc_pkgs <- c("proDA", "imputeLCMD")   # Bioconductor (imputeLCMD also needs pcaMethods, impute)
+
+options(repos = c(CRAN = "https://cloud.r-project.org"))   # CRAN mirror (needed when knitting non-interactively)
+
+missing_cran <- setdiff(cran_pkgs, rownames(installed.packages()))
+if (length(missing_cran)) install.packages(missing_cran)
+missing_bioc <- setdiff(bioc_pkgs, rownames(installed.packages()))
+if (length(missing_bioc)) {
+  if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+  BiocManager::install(missing_bioc, update = FALSE, ask = FALSE)
+}
+
+for (pkg in c("readxl", "dplyr", "tidyr", "ggplot2", "ggrepel", "pheatmap", "protti",
+              "dendextend", "seriation", "proDA", "imputeLCMD",
+              "parsnip", "workflows", "tune", "rsample", "yardstick", "dials",
+              "recipes", "kernlab", "ranger", "pROC", "httr", "jsonlite", "igraph"))
+  library(pkg, character.only = TRUE)
+
+## dials (tidymodels) also exports a degree(); the network code needs igraph's.
+degree <- igraph::degree
+```
+
+# Data
+
+```{r import}
+# Reads the DIA-NN protein matrix, cleans it and builds the log2 intensity matrix and gene-symbol lookup.
+raw <- as.data.frame(read_excel("report_STUDY.pg_matrix.xlsx", sheet = 1))
+raw <- raw[rowSums(!is.na(raw)) > 0, , drop = FALSE]    # blank rows
+raw <- raw %>% filter(row_number() <= n() - 1)          # trailing count row
+raw <- raw %>% rename(i12 = i12_20250410100059)
+
+annot_cols_original <- c("Protein.Group", "Protein.Names", "Genes",
+                         "First.Protein.Description", "N.Sequences",
+                         "N.Proteotypic.Sequences")
+annot_cols <- c("protein_group", "protein_names", "genes",
+                "first_protein_description", "n_sequences", "n_proteotypic_sequences")
+sample_cols <- setdiff(colnames(raw), annot_cols_original)
+names(raw)[match(annot_cols_original, names(raw))] <- annot_cols
+
+## Protein x sample matrix of raw intensities and its log2
+intens <- as.matrix(raw[, sample_cols])
+rownames(intens) <- raw$protein_group
+storage.mode(intens) <- "double"
+logI_raw <- log2(intens)
+
+## Gene symbols for labelling (first symbol if a protein group has several)
+protein_lookup <- raw %>% distinct(protein_group, protein_names, genes)
+sym_lookup <- setNames(sub(";.*$", "", protein_lookup$genes), protein_lookup$protein_group)
+no_symbol <- is.na(sym_lookup) | sym_lookup == ""
+sym_lookup[no_symbol] <- names(sym_lookup)[no_symbol]
+```
+
+```{r metadata}
+# Assigns each sample to HC, IBS or IBD (and to IBD vs non-IBD) and defines the long-format helper.
+meta <- data.frame(
+  sample_id = sample_cols,
+  group = case_when(grepl("^GIBS", sample_cols) ~ "HC",
+                    grepl("^MIBS", sample_cols) ~ "IBS",
+                    grepl("^i[0-9]", sample_cols) ~ "IBD"),
+  stringsAsFactors = FALSE)
+stopifnot(!anyNA(meta$group))
+meta$group <- factor(meta$group, levels = c("HC", "IBS", "IBD"))
+## HC and IBS are pooled as "non_IBD" for all IBD vs non-IBD comparisons
+meta$ibd_status <- factor(ifelse(meta$group == "IBD", "IBD", "non_IBD"),
+                          levels = c("IBD", "non_IBD"))
+
+knitr::kable(as.data.frame(table(Group = meta$group)), caption = "Samples per group")
+
+## Long format, as protti expects it
+to_long <- function(mat) {
+  d <- as.data.frame(mat)
+  d$protein <- rownames(mat)
+  d <- pivot_longer(d, -protein, names_to = "sample", values_to = "intensity_log2")
+  left_join(d, meta, by = c("sample" = "sample_id"))
+}
+```
+
+```{r plot-helpers}
+# Defines the plotting and PCA helper functions used in the data-preparation section since they are run twice.
+## Per-sample boxplots of the log2 intensities before and after PQN
+pqn_boxplot <- function(before, after, title) {
+  box_df <- rbind(
+    data.frame(sample = rep(colnames(before), each = nrow(before)),
+               value = as.vector(before), stage = "before PQN"),
+    data.frame(sample = rep(colnames(after), each = nrow(after)),
+               value = as.vector(after), stage = "after PQN"))
+  box_df$group <- meta$group[match(box_df$sample, meta$sample_id)]
+  box_df$stage <- factor(box_df$stage, levels = c("before PQN", "after PQN"))
+  ggplot(box_df, aes(x = sample, y = value, fill = group)) +
+    geom_boxplot(outlier.size = 0.3) +
+    facet_wrap(~stage, ncol = 1) +
+    labs(y = "log2 intensity", x = NULL, title = title) +
+    theme_minimal(base_size = 8) +
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+}
+
+## Histogram of imputed (red) vs. measured (grey) values
+imputed_plot <- function(imputed, observed, title)
+  data.frame(value = as.vector(imputed),
+             status = ifelse(as.vector(is.na(observed)), "imputed", "observed")) %>%
+  ggplot(aes(x = value, fill = status)) +
+  geom_histogram(bins = 50, position = "identity", alpha = 0.7) +
+  scale_fill_manual(values = c(observed = "grey60", imputed = "firebrick"), name = NULL) +
+  labs(x = "log2 intensity (PQN-normalised)", y = "Count", title = title) +
+  theme_minimal(base_size = 10)
+
+## PCA scatter plot of two components, coloured by IBD status
+pca_plot <- function(logI_imputed, components)
+  qc_pca(data = to_long(logI_imputed), sample = sample, grouping = protein,
+         intensity = intensity_log2, condition = ibd_status,
+         components = components, plot_style = "pca")
+
+## Variance explained by PC1-5 and their Spearman correlation with the number of missing proteins
+pca_table <- function(logI_imputed, logI_observed, caption) {
+  pca <- prcomp(t(logI_imputed), center = TRUE, scale. = FALSE)
+  n_missing <- colSums(is.na(logI_observed))[rownames(pca$x)]
+  knitr::kable(
+    data.frame(PC = paste0("PC", 1:5),
+               variance = 100 * pca$sdev[1:5]^2 / sum(pca$sdev^2),
+               rho = sapply(1:5, function(k) cor(pca$x[, k], n_missing, method = "spearman"))),
+    digits = 2, caption = caption,
+    col.names = c("component", "variance explained (%)", "Spearman rho with # missing proteins"))
+}
+```
+
+# Data preparation
+
+## Sample quality control
+
+```{r qc-sample-correlation, fig.width=8, fig.height=7}
+# Sample-to-sample correlation heatmap (protti) of the raw data.
+qc_cor <- qc_sample_correlation(
+  data = to_long(logI_raw), sample = sample, grouping = protein,
+  intensity_log2 = intensity_log2, condition = group, interactive = FALSE)
+print(qc_cor)
+```
+
+```{r qc-mean-correlation, fig.width=9, fig.height=5}
+# Mean pairwise correlation per sample, to flag outlier samples.
+## Mean pairwise Spearman correlation of each sample with all others
+cor_mat <- suppressWarnings(cor(logI_raw, use = "pairwise.complete.obs", method = "spearman"))
+diag(cor_mat) <- NA
+cor_df <- data.frame(sample = colnames(cor_mat), mean_corr = rowMeans(cor_mat, na.rm = TRUE)) %>%
+  arrange(mean_corr)
+cor_df$sample <- factor(cor_df$sample, levels = cor_df$sample)
+cor_df$flag <- c("lowest", "second_lowest", rep("other", nrow(cor_df) - 2))
+
+ggplot(cor_df, aes(x = sample, y = mean_corr, fill = flag)) +
+  geom_col() +
+  geom_text(data = filter(cor_df, flag != "other"), aes(label = sample),
+            vjust = -0.5, size = 3.2, fontface = "bold") +
+  scale_fill_manual(values = c(lowest = "firebrick", second_lowest = "darkorange", other = "grey70"),
+                    guide = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(x = NULL, y = "Mean pairwise Spearman correlation",
+       title = "Raw-data QC: mean pairwise correlation per sample") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+
+cat("Lowest-correlating sample:", as.character(cor_df$sample[1]),
+    sprintf("(mean r = %.2f, cohort median = %.2f)\n", cor_df$mean_corr[1], median(cor_df$mean_corr)))
+cat("Second-lowest-correlating sample:", as.character(cor_df$sample[2]),
+    sprintf("(mean r = %.2f)\n", cor_df$mean_corr[2]))
+```
+
+## Feature filtering
+
+Proteins are kept if they have at least two supporting peptides and are detected in at least 60 % of the samples of at least one group.
+
+```{r feature-filter}
+n_peptides <- raw$n_sequences[match(rownames(intens), raw$protein_group)]
+keep_peptide_support <- n_peptides > 1
+
+grp_idx <- split(seq_len(ncol(intens)), meta$group[match(colnames(intens), meta$sample_id)])
+detect_rate_by_grp <- sapply(grp_idx, function(idx) rowMeans(!is.na(intens[, idx, drop = FALSE])))
+keep_detection <- apply(detect_rate_by_grp, 1, function(x) any(x >= 0.6))
+
+keep_feature <- keep_peptide_support & keep_detection
+cat("Protein groups:", nrow(intens), "\n")
+cat("Pass peptide-support filter (>= 2 supporting peptides):", sum(keep_peptide_support), "\n")
+cat("Pass detection filter (>= 60 % in >= 1 group):", sum(keep_detection), "\n")
+cat("Proteins kept (both filters):", sum(keep_feature), "\n")
+
+logI_f <- logI_raw[keep_feature, , drop = FALSE]
+```
+
+## Normalisation and imputation
+
+Samples are normalised by probabilistic quotient normalisation (PQN): each sample is rescaled by its median quotient to a reference profile (the protein medians). Missing values are imputed with QRILC (quantile regression imputation of left-censored data) for the PCA and the classifiers only. QRILC works on one sample at a time and uses a fixed seed. Differential abundance and the co-abundance networks use the normalised data with the missing values kept.
+
+```{r pqn-qrilc}
+# Normalises the filtered data with PQN and imputes missing values with QRILC (48 samples).
+pqn_log <- function(mat) {
+  ref <- apply(mat, 1, median, na.rm = TRUE)
+  sample_factor <- apply(sweep(mat, 1, ref, "-"), 2, median, na.rm = TRUE)
+  sweep(mat, 2, sample_factor, "-")
+}
+
+## M is proteins x samples; samples without a missing value are left alone.
+qrilc_impute <- function(M, seed = params$seed) {
+  set.seed(seed)
+  has_na <- colSums(is.na(M)) > 0
+  if (any(has_na))
+    M[, has_na] <- impute.QRILC(M[, has_na, drop = FALSE], tune.sigma = 1)[[1]]
+  M
+}
+
+logI_norm <- pqn_log(logI_f)
+logI_qrilc48 <- qrilc_impute(logI_norm)
+cat("Imputed values (48 samples):", sum(is.na(logI_norm)), "of", length(logI_norm),
+    sprintf("(%.1f%%)\n", 100 * mean(is.na(logI_norm))))
+```
+
+```{r pqn-plot-48, fig.height=4}
+# Per-sample intensity boxplots before and after PQN (48 samples).
+pqn_boxplot(logI_f, logI_norm, "Per-sample distribution before vs. after PQN normalization")
+```
+
+```{r qrilc-distribution-48, fig.width=7, fig.height=4}
+# Histogram of imputed vs. measured values (48 samples).
+## Imputed values should fall in the low tail, below almost all measured values.
+imputed_plot(logI_qrilc48, logI_norm, "QRILC (48 samples): imputed values vs. measured values")
+```
+
+## PCA and removal of i11
+
+The PCA runs on the imputed matrix. Each of the first five components is correlated (Spearman) with the number of missing proteins per sample, because imputed values sit at the low end and a sample with many missing proteins is pulled in one direction.
+
+```{r pca-48-plots}
+# PCA score plots of the imputed data, PC1-PC3 pairs (48 samples).
+pca_plot(logI_qrilc48, c("PC1", "PC2"))
+pca_plot(logI_qrilc48, c("PC2", "PC3"))
+pca_plot(logI_qrilc48, c("PC1", "PC3"))
+```
+
+```{r pca-48-table}
+# Variance explained by PC1-5 and their correlation with the number of missing proteins (48 samples).
+pca_table(logI_qrilc48, logI_norm, "PCA of the QRILC-imputed matrix (48 samples)")
+```
+
+Sample i11 has the lowest correlation with the other samples and is isolated on PC1. It is removed from the filtered data, and the remaining 47 samples are normalised and imputed again from scratch.
+
+```{r remove-i11}
+# Removes i11, then re-normalises (PQN) and re-imputes (QRILC) the remaining 47 samples.
+logI_f_no_i11 <- logI_f[, colnames(logI_f) != "i11", drop = FALSE]
+logI_final <- pqn_log(logI_f_no_i11)       # normalised, NOT imputed
+logI_qrilc <- qrilc_impute(logI_final)     # normalised and imputed
+cat("Samples remaining:", ncol(logI_final), "/", ncol(logI_f), "\n")
+cat("Imputed values (47 samples):", sum(is.na(logI_final)), "of", length(logI_final),
+    sprintf("(%.1f%%)\n", 100 * mean(is.na(logI_final))))
+```
+
+```{r pqn-plot-47, fig.height=4}
+# Per-sample intensity boxplots before and after PQN (47 samples).
+pqn_boxplot(logI_f_no_i11, logI_final, "Per-sample distribution before vs. after PQN normalization (i11 removed)")
+```
+
+```{r qrilc-distribution-47, fig.width=7, fig.height=4}
+# Histogram of imputed vs. measured values (47 samples).
+imputed_plot(logI_qrilc, logI_final, "QRILC (47 samples): imputed values vs. measured values")
+```
+
+```{r pca-47-plots}
+# PCA score plots of the imputed data, PC1-PC3 pairs (47 samples).
+pca_plot(logI_qrilc, c("PC1", "PC2"))
+pca_plot(logI_qrilc, c("PC2", "PC3"))
+pca_plot(logI_qrilc, c("PC1", "PC3"))
+```
+
+```{r pca-47-table}
+# Variance explained by PC1-5 and their correlation with the number of missing proteins (47 samples).
+pca_table(logI_qrilc, logI_final, "PCA of the QRILC-imputed matrix (47 samples)")
+```
+
+# Aim 1: can machine learning diagnose IBD from stool proteins?
+
+An RBF-kernel support vector machine (SVM) and a random forest are trained on the imputed log2 intensities (`logI_qrilc`) to separate IBD from non-IBD. Performance is estimated with nested, repeated cross-validation: an outer 5-fold loop (stratified, repeated 5 times) estimates performance, and an inner 5-fold loop inside each outer training set tunes the model settings by AUC. Scaling is learned on the training samples only (inside the workflow), so the held-out fold takes no part in fitting or tuning. To test whether performance beats chance, the whole nested procedure is repeated 50 times on shuffled labels, which gives a null distribution of AUCs and a permutation p-value.
+
+```{r clf-features}
+# Builds the feature matrix (imputed log2 intensities) and the IBD / non-IBD outcome for the classifiers.
+clf_mat <- t(logI_qrilc)
+clf_mat <- clf_mat[, apply(clf_mat, 2, sd) > 0, drop = FALSE]    # constant proteins carry no information
+clf_x <- as.data.frame(clf_mat)
+colnames(clf_x) <- paste0("f", seq_len(ncol(clf_x)))             # safe column names for the models
+clf_y <- factor(as.character(meta$ibd_status[match(rownames(clf_mat), meta$sample_id)]),
+                levels = c("non_IBD", "IBD"))                    # IBD = positive class
+cat("Samples:", nrow(clf_x), "| protein features:", ncol(clf_x), "\n")
+print(table(clf_y))
+```
+
+```{r clf-functions}
+# Defines the models, tuning grids, nested cross-validation, parallel permutation test and summary/plot helpers.
+clf_k     <- 5     # folds (outer and inner)
+clf_reps  <- 5     # outer repeats
+clf_nperm <- 50    # label permutations (smallest possible p = 1 / (clf_nperm + 1))
+clf_workers <- max(1, min(parallel::detectCores() - 1, 8))
+
+make_folds <- function(y, k, seed) {              # stratified fold assignment
+  set.seed(seed)
+  f <- integer(length(y))
+  for (lev in levels(y)) {
+    i <- which(y == lev)
+    f[i] <- sample(rep_len(seq_len(k), length(i)))
+  }
+  f
+}
+
+## step_zv drops constant proteins; step_normalize standardises each protein
+## (needed for the RBF kernel; trees do not need it).
+make_rec <- function(dat, scale = TRUE) {
+  rec <- recipe(ibd ~ ., data = dat) %>% step_zv(all_predictors())
+  if (scale) rec <- rec %>% step_normalize(all_predictors())
+  rec
+}
+
+p_ibd <- function(m, x) predict(m, x, type = "prob")$.pred_IBD
+auc_of <- function(y, p)
+  as.numeric(pROC::auc(pROC::roc(y, p, levels = c("non_IBD", "IBD"), direction = "<", quiet = TRUE)))
+
+## Models and tuning grids. SVM: cost and RBF width (sigma); the grid is centred
+## around 1/(2 x number of proteins). Forest: proteins tried per split (mtry) and
+## minimum node size (min_n), 500 trees.
+svm_spec <- svm_rbf(cost = tune(), rbf_sigma = tune()) %>%
+  set_engine("kernlab", scaled = FALSE) %>% set_mode("classification")
+svm_grid <- expand.grid(cost = 2^c(-1, 1, 3, 5), rbf_sigma = 2^c(-11, -9, -7, -5))
+rf_spec <- rand_forest(mtry = tune(), min_n = tune(), trees = 500) %>%
+  set_engine("ranger", importance = "impurity") %>% set_mode("classification")
+rf_grid <- expand.grid(mtry = c(3, 6, 12, 24), min_n = c(2, 4, 8, 12))
+
+## Tune by 5-fold CV on AUC, keep the best setting, refit on all data given.
+fit_tuned <- function(x, y, spec, grid, scale) {
+  dat <- data.frame(ibd = y, x)
+  wf <- workflow(make_rec(dat, scale), spec)
+  tuned <- tune_grid(wf, resamples = vfold_cv(dat, v = 5, strata = ibd),
+                     grid = grid, metrics = metric_set(roc_auc))
+  fit(finalize_workflow(wf, select_best(tuned, metric = "roc_auc")), dat)
+}
+svm_fit <- function(x, y) fit_tuned(x, y, svm_spec, svm_grid, scale = TRUE)
+rf_fit  <- function(x, y) fit_tuned(x, y, rf_spec, rf_grid, scale = FALSE)
+
+## Nested CV: every sample gets one out-of-fold probability of IBD per repeat.
+## The seed fixes the inner CV and the forest.
+run_cv <- function(x, y, reps, fit, seed0 = 0) {
+  oof <- matrix(NA_real_, nrow(x), reps)
+  for (r in seq_len(reps)) {
+    folds <- make_folds(y, clf_k, seed0 + r)
+    for (f in seq_len(clf_k)) {
+      tr <- folds != f
+      set.seed(seed0 * 1000 + r * 10 + f)
+      oof[!tr, r] <- p_ibd(fit(x[tr, ], y[tr]), x[!tr, ])
+    }
+  }
+  oof
+}
+svm_cv <- function(x, y, reps, seed0 = 0) run_cv(x, y, reps, svm_fit, seed0)
+rf_cv  <- function(x, y, reps, seed0 = 0) run_cv(x, y, reps, rf_fit, seed0)
+
+## Permutation null, run in parallel (PSOCK cluster, works on Windows). Each
+## permutation is an independent, seeded run of the whole nested CV on shuffled
+## labels, so the result does not depend on the number of workers. Without a
+## cluster the permutations run one after the other.
+perm_null <- function(cv_fun) {
+  src <- environment(auc_of)
+  one <- function(b, cv_fun) {
+    set.seed(5000 + b)
+    y_perm <- sample(clf_y)
+    auc_of(y_perm, cv_fun(clf_x, y_perm, reps = 1, seed0 = 100 * b)[, 1])
+  }
+  environment(one) <- src
+  serial <- function() vapply(seq_len(clf_nperm), one, numeric(1), cv_fun = cv_fun)
+  if (clf_workers < 2) return(serial())
+  tryCatch({
+    cl <- parallel::makeCluster(clf_workers)
+    on.exit(parallel::stopCluster(cl), add = TRUE)
+    parallel::clusterEvalQ(cl, {
+      Sys.setenv(R_RANGER_NUM_THREADS = "1", OMP_NUM_THREADS = "1")
+      options(ranger.num.threads = 1)
+      for (p in c("parsnip", "workflows", "tune", "rsample", "yardstick", "dials",
+                  "recipes", "kernlab", "ranger", "pROC")) library(p, character.only = TRUE)
+      NULL
+    })
+    nm <- intersect(c("clf_x", "clf_y", "clf_k", "make_folds", "make_rec", "p_ibd", "auc_of",
+                      "svm_spec", "svm_grid", "rf_spec", "rf_grid", "fit_tuned", "svm_fit",
+                      "rf_fit", "run_cv", "svm_cv", "rf_cv"), ls(src))
+    parallel::clusterExport(cl, nm, envir = src)
+    one_w <- one; environment(one_w) <- globalenv()
+    cv_w <- cv_fun; environment(cv_w) <- globalenv()
+    cat("Permutations run on", clf_workers, "parallel workers\n")
+    unlist(parallel::parLapplyLB(cl, seq_len(clf_nperm), one_w, cv_fun = cv_w))
+  }, error = function(e) {
+    cat("Parallel run failed (", conditionMessage(e), "); running the permutations one by one.\n")
+    serial()
+  })
+}
+
+## Summaries and plots shared by both models
+cv_bacc <- function(oof) apply(oof, 2, function(p) {         # balanced accuracy at the 0.5 cutoff
+  pred <- p >= 0.5
+  mean(c(mean(pred[clf_y == "IBD"]), mean(!pred[clf_y == "non_IBD"])))
+})
+cv_table <- function(auc, bacc, caption)
+  knitr::kable(data.frame(metric = c("AUC", "Balanced accuracy"),
+                          mean = c(mean(auc), mean(bacc)), sd = c(sd(auc), sd(bacc))),
+               digits = 3, caption = caption)
+perm_report <- function(auc, null) {
+  p <- (1 + sum(null >= mean(auc))) / (clf_nperm + 1)
+  cat(sprintf("Observed AUC %.3f | null mean %.3f (sd %.3f) | permutation p = %.3f (%d permutations)\n",
+              mean(auc), mean(null), sd(null), p, clf_nperm))
+}
+plot_roc <- function(oof, col, main) {
+  plot(NULL, xlim = c(1, 0), ylim = c(0, 1), xlab = "Specificity", ylab = "Sensitivity", main = main)
+  abline(1, -1, lty = 2, col = "grey60")
+  for (r in seq_len(ncol(oof)))
+    lines(pROC::roc(clf_y, oof[, r], levels = c("non_IBD", "IBD"), direction = "<", quiet = TRUE),
+          col = adjustcolor(col, 0.6))
+}
+plot_null <- function(null, auc, col, main) {
+  hist(null, breaks = 12, col = "grey80", border = "white", xlim = c(0.2, 0.9),
+       main = main, xlab = "Cross-validated AUC")
+  abline(v = mean(auc), col = col, lwd = 2)
+  abline(v = 0.5, lty = 2)
+}
+## Youden cutoff on the averaged out-of-fold P(IBD): the point on the ROC curve
+## that maximises sensitivity + specificity. It is chosen on the predictions it
+## is scored on, so its sensitivity and specificity are optimistic.
+youden <- function(oof)
+  pROC::coords(pROC::roc(clf_y, rowMeans(oof), levels = c("non_IBD", "IBD"), direction = "<", quiet = TRUE),
+         "best", best.method = "youden", ret = c("threshold", "sensitivity", "specificity"))[1, ]
+```
+
+## RBF-kernel SVM
+
+```{r svm-cv}
+# Runs the nested cross-validation for the SVM and reports AUC and balanced accuracy.
+svm_oof <- svm_cv(clf_x, clf_y, clf_reps)
+svm_auc <- apply(svm_oof, 2, auc_of, y = clf_y)
+cv_table(svm_auc, cv_bacc(svm_oof), "RBF-SVM, nested 5-fold CV x 5 repeats")
+```
+
+```{r svm-roc, fig.width=6, fig.height=5}
+# Out-of-fold ROC curves of the SVM (one per repeat).
+plot_roc(svm_oof, "firebrick", "SVM: out-of-fold ROC curves (one per repeat)")
+```
+
+```{r svm-permutation}
+# Label-permutation test of the SVM AUC (50 permutations).
+svm_null <- perm_null(svm_cv)
+perm_report(svm_auc, svm_null)
+```
+
+```{r svm-null-plot, fig.width=6.5, fig.height=4}
+# Observed SVM AUC against its permutation null, plus the Youden threshold.
+plot_null(svm_null, svm_auc, "firebrick", "SVM: observed AUC (red) vs. label-permutation null")
+knitr::kable(youden(svm_oof), digits = 3, row.names = FALSE, caption = "Youden threshold (SVM)")
+```
+
+## Random forest
+
+```{r rf-cv}
+# Runs the nested cross-validation for the random forest and reports AUC and balanced accuracy.
+rf_oof <- rf_cv(clf_x, clf_y, clf_reps)
+rf_auc <- apply(rf_oof, 2, auc_of, y = clf_y)
+cv_table(rf_auc, cv_bacc(rf_oof), "Random forest, nested 5-fold CV x 5 repeats")
+```
+
+```{r rf-roc, fig.width=6, fig.height=5}
+# Out-of-fold ROC curves of the random forest (one per repeat).
+plot_roc(rf_oof, "darkgreen", "Random forest: out-of-fold ROC curves (one per repeat)")
+```
+
+```{r rf-permutation}
+# Label-permutation test of the random forest AUC (50 permutations).
+rf_null <- perm_null(rf_cv)
+perm_report(rf_auc, rf_null)
+```
+
+```{r rf-null-plot, fig.width=6.5, fig.height=4}
+# Observed forest AUC against its permutation null, plus the Youden threshold.
+plot_null(rf_null, rf_auc, "darkgreen", "Random forest: observed AUC (green) vs. label-permutation null")
+knitr::kable(youden(rf_oof), digits = 3, row.names = FALSE, caption = "Youden threshold (random forest)")
+```
+
+# Aim 2: single-protein view (differential abundance with proDA)
+
+proDA is a probabilistic dropout model: a missing value counts as "probably low" instead of being imputed, so the test runs on the normalised data **without** QRILC (`logI_final`, 47 samples). Raw p-values are adjusted with the Benjamini-Hochberg (BH) procedure, and |log2 fold change| > 0.5 marks the abundance candidates.
+
+```{r diff-abundance}
+# Runs proDA differential abundance (IBD vs non-IBD) on the non-imputed data with BH adjustment.
+long_final <- to_long(logI_final)
+
+## proDA on the missingness-filtered, non-imputed data; the grouping column is `cond`.
+run_proda <- function(data)
+  calculate_diff_abundance(
+    data = assign_missingness(data = data, sample = sample, condition = cond,
+                              grouping = protein, intensity = intensity_log2,
+                              ref_condition = "all", completeness_MAR = 0.7,
+                              completeness_MNAR = 0.20, retain_columns = NULL),
+    sample = sample, condition = cond, grouping = protein,
+    intensity_log2 = intensity_log2, missingness = missingness, comparison = comparison,
+    ref_condition = "all", filter_NA_missingness = TRUE, method = "proDA", p_adj_method = "BH")
+
+diff_abundance_proda <- run_proda(long_final %>% mutate(cond = as.character(ibd_status)))
+
+## protti names the comparison "non_IBD_vs_IBD"; flip the sign so that a
+## positive difference means higher in IBD.
+if (unique(diff_abundance_proda$comparison) == "non_IBD_vs_IBD")
+  diff_abundance_proda <- diff_abundance_proda %>%
+    mutate(comparison = "IBD_vs_non_IBD", diff = -diff, t_statistic = -t_statistic)
+
+cat("Proteins with BH-adjusted p < 0.05:", sum(diff_abundance_proda$adj_pval < 0.05, na.rm = TRUE), "\n")
+```
+
+```{r da-hc-vs-ibs}
+# Repeats the proDA test for HC vs IBS to check that they can be pooled.
+## Can healthy controls and IBS be pooled? Same proDA settings, HC vs IBS.
+hc_ibs_da <- run_proda(long_final %>% filter(group %in% c("HC", "IBS")) %>%
+                         mutate(cond = as.character(group)))
+cat("Smallest raw p:", signif(min(hc_ibs_da$pval), 3),
+    "| smallest BH-adjusted p:", signif(min(hc_ibs_da$adj_pval), 3), "\n")
+cat("Proteins with raw p < 0.05:", sum(hc_ibs_da$pval < 0.05),
+    "(expected by chance:", round(0.05 * nrow(hc_ibs_da), 1), ")\n")
+cat("Proteins with BH-adjusted p < 0.05:", sum(hc_ibs_da$adj_pval < 0.05), "\n")
+```
+
+```{r da-table}
+# Table of the ten proteins with the smallest p-values.
+knitr::kable(
+  diff_abundance_proda %>%
+    left_join(protein_lookup, by = c("protein" = "protein_group")) %>%
+    arrange(pval) %>%
+    select(protein, protein_names, diff, pval, adj_pval) %>%
+    head(10),
+  digits = 3, col.names = c("protein", "protein name", "log2 FC", "p", "adjusted p"),
+  caption = "Ten smallest p-values (proDA, IBD vs non-IBD; positive = higher in IBD)")
+```
+
+```{r volcano, fig.width=10, fig.height=4}
+# Volcano plot of log2 fold change against p-value, with the abundance candidates labelled.
+volcano_df <- diff_abundance_proda %>%
+  left_join(protein_lookup, by = c("protein" = "protein_group")) %>%
+  mutate(sig_raw = factor(case_when(diff > 0.5 ~ "Significantly up",
+                                    diff < -0.5 ~ "Significantly down",
+                                    TRUE ~ "Not significant"),
+                          levels = c("Significantly up", "Significantly down", "Not significant")))
+print(table(volcano_df$comparison, volcano_df$sig_raw))
+
+ggplot(volcano_df, aes(x = diff, y = -log10(pval), color = sig_raw)) +
+  geom_point(size = 1.2, alpha = 0.7) +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", color = "grey40", linewidth = 0.3) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey40", linewidth = 0.3) +
+  geom_text_repel(data = filter(volcano_df, sig_raw != "Not significant"),
+                  aes(label = protein_names), size = 2, show.legend = FALSE,
+                  max.overlaps = 20, segment.size = 0.2) +
+  scale_color_manual(values = c("Significantly up" = "firebrick", "Significantly down" = "steelblue",
+                                "Not significant" = "grey70"), name = NULL) +
+  facet_wrap(~comparison) +
+  labs(x = "log2 fold change", y = expression(-log[10](p)),
+       title = "Differential abundance between groups (proDA) -- raw p-value",
+       subtitle = "Cutoffs: |log2 fold change| > 0.5 and p < 0.05 (raw p-value)") +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "bottom")
+```
+
+# Aim 2: co-abundance networks
+
+All networks are built from the normalised, **non-imputed** data (`logI_final`). Correlations are Spearman correlations on the samples where both proteins were measured, and an edge needs |rho| >= 0.6 and a BH-adjusted q < 0.05. Modules are found with Louvain clustering on |rho|-weighted edges and hubs are ranked by degree.
+
+## Pooled network (all 47 samples)
+
+Following Chen et al. (Nat Commun 2020), co-abundances are called with two methods and only edges found by both are kept: marginal correlation (Spearman) and conditional dependence (a shrinkage partial correlation, which removes indirect associations). Pairs need at least 20 shared samples. The partial-correlation cutoff is the 95th percentile of the largest |partial correlation| in 100 permutations in which every protein's values are shuffled independently.
+
+```{r coab-correlations}
+# Builds the pooled co-abundance edges: Spearman and shrinkage partial correlation, keeping edges found by both.
+min_pairs <- 20
+coab_r_min <- 0.6
+coab_q_max <- 0.05
+coab_M <- t(logI_final)                       # samples x proteins
+
+pair_cor <- function(M, min_pairs) {
+  n <- crossprod(!is.na(M))
+  r <- suppressWarnings(cor(M, use = "pairwise.complete.obs", method = "spearman"))
+  r[n < min_pairs] <- NA
+  diag(r) <- NA
+  tstat <- r * sqrt((n - 2) / (1 - r^2))
+  p <- 2 * pt(-abs(tstat), df = n - 2)
+  ut <- upper.tri(r)
+  q <- matrix(NA_real_, nrow(r), ncol(r), dimnames = dimnames(r))
+  q[ut] <- p.adjust(p[ut], method = "BH")
+  list(r = r, n = n, p = p, q = q)
+}
+
+## Shrinkage partial correlation. The correlation matrix is shrunk towards the
+## identity (intensity from the sampling variance of each correlation) and raised
+## until its smallest eigenvalue is >= 0.1, because pairwise-complete correlations
+## are not positive definite; it is then inverted and rescaled.
+shrink_pcor <- function(M, min_pairs, lambda = NULL) {
+  pc <- pair_cor(M, min_pairs)
+  R <- pc$r
+  diag(R) <- 1
+  R[is.na(R)] <- 0
+  n <- pmax(pc$n, 3)
+  if (is.null(lambda)) {
+    off <- row(R) != col(R)
+    lambda <- min(1, max(0, sum(((1 - R^2)^2 / (n - 1))[off]) / sum(R[off]^2)))
+    ev_min <- min(eigen(R, symmetric = TRUE, only.values = TRUE)$values)
+    lambda <- max(lambda, min(1, (0.1 - ev_min) / (1 - ev_min)))
+  }
+  Rs <- (1 - lambda) * R
+  diag(Rs) <- 1
+  ev <- eigen(Rs, symmetric = TRUE)
+  Rs <- ev$vectors %*% diag(pmax(ev$values, 1e-6)) %*% t(ev$vectors)
+  P <- solve(Rs)
+  pcor <- -P / sqrt(outer(diag(P), diag(P)))
+  diag(pcor) <- NA
+  dimnames(pcor) <- dimnames(R)
+  list(pcor = pcor, lambda = lambda)
+}
+
+coab_all <- pair_cor(coab_M, min_pairs)
+coab_pc <- shrink_pcor(coab_M, min_pairs)
+
+set.seed(params$seed)
+pcor_null_max <- vapply(seq_len(100), function(b) {
+  Mp <- apply(coab_M, 2, function(v) v[sample(length(v))])
+  max(abs(shrink_pcor(Mp, min_pairs, lambda = coab_pc$lambda)$pcor), na.rm = TRUE)
+}, numeric(1))
+pcor_cut <- unname(quantile(pcor_null_max, 0.95))
+
+ut <- upper.tri(coab_all$r)
+marg_idx <- which(ut & !is.na(coab_all$q) & coab_all$q < coab_q_max & abs(coab_all$r) >= coab_r_min, arr.ind = TRUE)
+cond_idx <- which(ut & !is.na(coab_pc$pcor) & abs(coab_pc$pcor) >= pcor_cut, arr.ind = TRUE)
+edge_key <- function(idx) paste(idx[, 1], idx[, 2])
+both_idx <- marg_idx[edge_key(marg_idx) %in% edge_key(cond_idx), , drop = FALSE]
+
+coab_edges <- data.frame(from = rownames(coab_all$r)[both_idx[, 1]],
+                         to = colnames(coab_all$r)[both_idx[, 2]],
+                         r = coab_all$r[both_idx], q = coab_all$q[both_idx],
+                         pcor = coab_pc$pcor[both_idx])
+cat("Proteins:", ncol(coab_M), "| tested pairs:", sum(!is.na(coab_all$q[ut])), "\n")
+cat("Marginal edges (|rho| >=", coab_r_min, "& BH q <", coab_q_max, "):", nrow(marg_idx), "\n")
+cat("Conditional edges (|partial cor| >=", round(pcor_cut, 3), ", permutation-calibrated; shrinkage =",
+    round(coab_pc$lambda, 2), "):", nrow(cond_idx), "\n")
+cat("Edges found by both methods (kept):", nrow(coab_edges), "\n")
+```
+
+```{r coab-network-build}
+# Builds the pooled network graph and finds Louvain modules.
+g <- graph_from_data_frame(coab_edges, directed = FALSE, vertices = data.frame(name = colnames(coab_M)))
+E(g)$weight <- abs(E(g)$r)
+V(g)$symbol <- sym_lookup[V(g)$name]
+
+set.seed(params$seed)
+comm <- cluster_louvain(g, weights = E(g)$weight)
+V(g)$module <- membership(comm)
+V(g)$degree <- degree(g)
+g_plot <- induced_subgraph(g, which(V(g)$degree > 0))
+
+cat("Nodes with at least one edge:", vcount(g_plot), "of", vcount(g),
+    "| edges:", ecount(g_plot),
+    "| modules (size >= 3):", sum(table(V(g_plot)$module) >= 3),
+    "| modularity:", round(modularity(comm), 2), "\n")
+```
+
+```{r coab-network-plot, fig.width=10, fig.height=8}
+# Plots the pooled consensus network (colour = module, size = degree).
+## Colour = module, size = degree, labels = the 10 highest-degree hubs;
+## grey edges are positive correlations, purple edges negative.
+pal <- c("#4E79A7", "#F28E2B", "#59A14F", "#B07AA1", "#76B7B2", "#EDC948", "#9C755F", "#E15759")
+mods <- V(g_plot)$module
+big_mods <- names(sort(table(mods), decreasing = TRUE))
+mod_col <- setNames(rep("grey80", length(big_mods)), big_mods)
+n_col <- min(length(pal), sum(table(mods) >= 3))
+mod_col[big_mods[seq_len(n_col)]] <- pal[seq_len(n_col)]
+
+hub_cut <- sort(degree(g_plot), decreasing = TRUE)[min(10, vcount(g_plot))]
+set.seed(params$seed)
+lay <- layout_with_fr(g_plot, weights = E(g_plot)$weight)
+plot(g_plot, layout = lay,
+     vertex.size = 4 + 1.5 * sqrt(degree(g_plot)),
+     vertex.color = mod_col[as.character(mods)], vertex.frame.color = "white",
+     vertex.label = ifelse(degree(g_plot) >= hub_cut, V(g_plot)$symbol, NA),
+     vertex.label.cex = 0.75, vertex.label.color = "black", vertex.label.font = 2,
+     edge.color = ifelse(E(g_plot)$r > 0, "grey60", "purple"),
+     edge.width = 0.5 + 3 * (E(g_plot)$weight - coab_r_min))
+title("Consensus co-abundance network (colour = Louvain module, size = degree; purple edges = negative)",
+      cex.main = 0.9)
+legend("bottomleft", legend = paste("Module", names(mod_col)[mod_col != "grey80"]),
+       fill = mod_col[mod_col != "grey80"], bty = "n", cex = 0.8)
+```
+
+There is no independent cohort to replicate the edges, so their stability is judged internally: 30 times a random 20 % of the samples is dropped, the marginal test is repeated on the remaining 80 % (minimum overlap scaled to 16 samples), and each consensus edge gets the fraction of subsamples in which it is found again.
+
+```{r coab-stability}
+# Checks edge stability by recomputing the network on 30 random 80 % subsamples.
+set.seed(params$seed)
+n_sub <- 30
+edge_hits <- matrix(0, nrow(coab_edges), n_sub)
+for (b in seq_len(n_sub)) {
+  keep_s <- sample(nrow(coab_M), size = round(0.8 * nrow(coab_M)))
+  s <- pair_cor(coab_M[keep_s, ], round(0.8 * min_pairs))
+  for (i in seq_len(nrow(coab_edges))) {
+    qi <- s$q[coab_edges$from[i], coab_edges$to[i]]
+    ri <- s$r[coab_edges$from[i], coab_edges$to[i]]
+    edge_hits[i, b] <- isTRUE(qi < coab_q_max && abs(ri) >= coab_r_min)
+  }
+}
+coab_edges$stability <- rowMeans(edge_hits)
+cat("Median edge recurrence:", round(median(coab_edges$stability), 2),
+    "| edges recurring in >= 80% of subsamples:", sum(coab_edges$stability >= 0.8), "/", nrow(coab_edges), "\n")
+```
+
+## Networks of IBD and non-IBD
+
+A network is built separately for the IBD samples (n = 25) and the non-IBD samples (HC and IBS pooled; n = 22), with the same rule and only the marginal (Spearman) criterion: a group has too few samples for stable partial correlations. The minimum number of shared observations per pair is 10. Modules are computed separately in each group, so module colours do not match between the two networks. Fewer edges in the smaller group partly reflect lower power.
+
+```{r grp-networks}
+# Builds the separate IBD and non-IBD Spearman networks, their modules and a shared layout.
+grp_min_pairs <- 10
+
+## The marginal rule, wrapped so it can be run on any set of samples (M = samples x proteins).
+coab_network <- function(M, min_pairs, r_min = coab_r_min, q_max = coab_q_max) {
+  cor_all <- pair_cor(M, min_pairs)
+  idx <- which(upper.tri(cor_all$r) & !is.na(cor_all$q) & cor_all$q < q_max & abs(cor_all$r) >= r_min,
+               arr.ind = TRUE)
+  list(n_samples = nrow(M), cor = cor_all,
+       n_tested = sum(!is.na(cor_all$q[upper.tri(cor_all$q)])),
+       edges = data.frame(from = rownames(cor_all$r)[idx[, 1]], to = colnames(cor_all$r)[idx[, 2]],
+                          r = cor_all$r[idx], q = cor_all$q[idx]))
+}
+
+grp_status <- meta$ibd_status[match(rownames(coab_M), meta$sample_id)]
+grp_net <- lapply(c(IBD = "IBD", non_IBD = "non_IBD"), function(grp)
+  coab_network(coab_M[grp_status == grp, , drop = FALSE], grp_min_pairs))
+for (grp in names(grp_net)) {
+  n <- grp_net[[grp]]
+  cat(sprintf("%-8s %2d samples | protein pairs tested: %4d | edges: %d\n",
+              grp, n$n_samples, n$n_tested, nrow(n$edges)))
+}
+
+## One graph per group over the same proteins, so that both can share node positions.
+make_grp_graph <- function(net) {
+  g <- graph_from_data_frame(net$edges, directed = FALSE, vertices = data.frame(name = colnames(coab_M)))
+  E(g)$weight <- abs(E(g)$r)
+  V(g)$symbol <- sym_lookup[V(g)$name]
+  V(g)$degree <- degree(g)
+  V(g)$module <- 0L                                    # 0 = no edge
+  set.seed(params$seed)
+  comm <- cluster_louvain(g, weights = E(g)$weight)
+  V(g)$module <- ifelse(V(g)$degree > 0, membership(comm), 0L)
+  g$modularity <- modularity(comm)
+  g
+}
+grp_g <- lapply(grp_net, make_grp_graph)
+
+## Proteins with an edge in at least one group are drawn, with a layout from the union of the edges.
+grp_nodes <- sort(unique(unlist(lapply(grp_g, function(g) V(g)$name[V(g)$degree > 0]))))
+union_edges <- do.call(rbind, lapply(grp_net, function(n) n$edges[, c("from", "to", "r")]))
+union_edges <- union_edges[!duplicated(paste(union_edges$from, union_edges$to)), ]
+g_union <- graph_from_data_frame(union_edges, directed = FALSE, vertices = data.frame(name = grp_nodes))
+set.seed(params$seed)
+lay_grp <- layout_with_fr(g_union, weights = abs(E(g_union)$r))
+```
+
+```{r grp-network-plot, fig.width=15, fig.height=8}
+# Plots the IBD and non-IBD networks side by side.
+## Colour = module within the group (grey = fewer than 3 proteins), size = degree,
+## labels = the 8 highest-degree hubs; proteins without an edge are small faint dots.
+plot_grp_net <- function(g, title) {
+  gs <- induced_subgraph(g, grp_nodes)
+  deg <- V(gs)$degree
+  mod <- V(gs)$module
+  big <- names(sort(table(mod[mod > 0]), decreasing = TRUE))
+  big <- big[table(mod[mod > 0])[big] >= 3]
+  col <- rep("grey75", length(mod))
+  for (i in seq_along(big)) col[mod == as.integer(big[i])] <- pal[(i - 1) %% length(pal) + 1]
+  col[mod == 0] <- "grey92"
+  hub_cut <- sort(deg, decreasing = TRUE)[min(8, sum(deg > 0))]
+  plot(gs, layout = lay_grp[match(V(gs)$name, grp_nodes), , drop = FALSE],
+       vertex.size = ifelse(deg > 0, 4 + 1.5 * sqrt(deg), 2),
+       vertex.color = col, vertex.frame.color = ifelse(deg > 0, "white", "grey85"),
+       vertex.label = ifelse(deg > 0 & deg >= hub_cut, V(gs)$symbol, NA),
+       vertex.label.cex = 0.75, vertex.label.color = "black", vertex.label.font = 2,
+       edge.color = ifelse(E(gs)$r > 0, "grey55", "purple"),
+       edge.width = 0.5 + 3 * (abs(E(gs)$r) - coab_r_min))
+  title(title, cex.main = 1)
+}
+op <- par(mfrow = c(1, 2), mar = c(1, 1, 3, 1))
+plot_grp_net(grp_g$IBD, sprintf("IBD (n = %d, %d edges)", grp_net$IBD$n_samples, nrow(grp_net$IBD$edges)))
+plot_grp_net(grp_g$non_IBD, sprintf("non-IBD (n = %d, %d edges)", grp_net$non_IBD$n_samples, nrow(grp_net$non_IBD$edges)))
+par(op)
+```
+
+```{r grp-summary}
+# Network properties, hub tables and edge overlap of the two group networks.
+grp_summary <- do.call(rbind, lapply(names(grp_g), function(nm) {
+  g <- grp_g[[nm]]; n <- grp_net[[nm]]
+  deg <- V(g)$degree
+  data.frame(group = nm, samples = n$n_samples, edges = nrow(n$edges),
+             positive = sum(n$edges$r > 0), negative = sum(n$edges$r < 0),
+             connected_proteins = sum(deg > 0), mean_degree = mean(deg[deg > 0]),
+             modules_ge3 = sum(table(V(g)$module[V(g)$module > 0]) >= 3), modularity = g$modularity)
+}))
+knitr::kable(grp_summary, digits = 2, caption = "Co-abundance networks per group")
+
+## Hubs: top 10 by degree (betweenness uses 1 / |rho| as distance)
+top_hubs <- function(g)
+  data.frame(protein = V(g)$name, symbol = V(g)$symbol, module = V(g)$module, degree = V(g)$degree,
+             betweenness = betweenness(g, weights = 1 / E(g)$weight)) %>%
+  filter(degree > 0) %>% arrange(desc(degree)) %>% head(10)
+knitr::kable(top_hubs(grp_g$IBD), digits = 1, row.names = FALSE, caption = "IBD: top 10 hubs by degree")
+knitr::kable(top_hubs(grp_g$non_IBD), digits = 1, row.names = FALSE, caption = "non-IBD: top 10 hubs by degree")
+
+k_ibd <- paste(grp_net$IBD$edges$from, grp_net$IBD$edges$to)
+k_non <- paste(grp_net$non_IBD$edges$from, grp_net$non_IBD$edges$to)
+cat("Edges in IBD:", length(k_ibd), "| in non-IBD:", length(k_non),
+    "| shared:", length(intersect(k_ibd, k_non)),
+    "| IBD only:", length(setdiff(k_ibd, k_non)),
+    "| non-IBD only:", length(setdiff(k_non, k_ibd)), "\n")
+```
+
+## Can HC and IBS be pooled as non-IBD?
+
+For every protein pair the Spearman correlations in HC and in IBS are compared with Fisher's z-transform, `atanh(rho)`: the difference divided by its standard error `sqrt(1.06 / (n - 3))` per group (1.06 corrects for Spearman being slightly noisier than Pearson) gives a z-score per pair. If the groups correlate proteins alike, the mean of z^2 over all pairs is about 1. Its null distribution comes from 100 shuffles of the HC / IBS labels among the 22 non-IBD samples.
+
+```{r pool-check}
+cor_z_diff <- function(M, in_a, min_n = 8) {
+  fz <- function(X) {
+    n <- crossprod(!is.na(X))
+    r <- suppressWarnings(cor(X, use = "pairwise.complete.obs", method = "spearman"))
+    list(z = atanh(pmin(pmax(r, -0.999), 0.999)), n = n)
+  }
+  a <- fz(M[in_a, , drop = FALSE])
+  b <- fz(M[!in_a, , drop = FALSE])
+  zd <- (a$z - b$z) / sqrt(1.06 / pmax(a$n - 3, 1) + 1.06 / pmax(b$n - 3, 1))
+  zd[a$n < min_n | b$n < min_n] <- NA
+  diag(zd) <- NA
+  zd
+}
+ut_all <- upper.tri(diag(ncol(coab_M)))
+
+pool_nperm <- 100
+pool_min_n <- 5                          # HC and IBS have only 10 and 12 samples
+non_ibd <- grp_status == "non_IBD"
+M_non <- coab_M[non_ibd, ]
+is_hc <- meta$group[match(rownames(M_non), meta$sample_id)] == "HC"
+
+z_hc_ibs <- cor_z_diff(M_non, is_hc, pool_min_n)
+pool_obs <- mean(z_hc_ibs[ut_all]^2, na.rm = TRUE)
+set.seed(params$seed)
+pool_null <- replicate(pool_nperm, mean(cor_z_diff(M_non, sample(is_hc), pool_min_n)[ut_all]^2, na.rm = TRUE))
+pool_p <- (1 + sum(pool_null >= pool_obs)) / (pool_nperm + 1)
+
+cat(sprintf("HC (n = %d) vs. IBS (n = %d): %d protein pairs compared\n",
+            sum(is_hc), sum(!is_hc), sum(!is.na(z_hc_ibs[ut_all]))))
+cat(sprintf("Mean squared z = %.3f | %.1f%% of pairs with |z| > 1.96 (5%% expected)\n",
+            pool_obs, 100 * mean(abs(z_hc_ibs[ut_all]) > 1.96, na.rm = TRUE)))
+cat(sprintf("Permutation null: mean %.3f (sd %.3f) | permutation p = %.3f\n",
+            mean(pool_null), sd(pool_null), pool_p))
+```
+
+## Differential co-abundance
+
+The same z-score is computed between IBD and non-IBD (positive = stronger correlation in IBD) for the edges of either group network, minus pairs with fewer than 8 shared samples in a group. Because these pairs were chosen for being strong in one group, the null distribution has to include that selection: the IBD / non-IBD labels are shuffled 100 times and in every shuffle both group networks are rebuilt, their edges pooled and their z-scores recorded. Each observed edge gets a p-value from how often shuffled data produce an edge with an equally large |z|, adjusted with BH. An overall test compares the mean squared z over all pairs with its shuffled distribution.
+
+```{r diff-coab}
+# Tests every edge of the group networks for a correlation difference between IBD and non-IBD (permutation p, BH q).
+diff_nperm <- 100
+diff_min_n <- 8
+
+## Edges of the two group networks (same rule as above), as linear matrix indices.
+select_edges <- function(M, in_a) {
+  f <- function(X) {
+    pc <- pair_cor(X, grp_min_pairs)
+    which(ut_all & !is.na(pc$q) & pc$q < coab_q_max & abs(pc$r) >= coab_r_min)
+  }
+  union(f(M[in_a, , drop = FALSE]), f(M[!in_a, , drop = FALSE]))
+}
+
+is_ibd <- grp_status == "IBD"
+z_obs <- cor_z_diff(coab_M, is_ibd, diff_min_n)
+sel_obs <- select_edges(coab_M, is_ibd)
+sel_obs_ok <- sel_obs[!is.na(z_obs[sel_obs])]
+glob_obs <- mean(z_obs[ut_all]^2, na.rm = TRUE)
+
+set.seed(params$seed)
+perm <- lapply(seq_len(diff_nperm), function(b) {
+  g <- sample(is_ibd)
+  z <- cor_z_diff(coab_M, g, diff_min_n)
+  s <- select_edges(coab_M, g)
+  list(global = mean(z[ut_all]^2, na.rm = TRUE), sel = abs(z[s][!is.na(z[s])]))
+})
+glob_null <- vapply(perm, `[[`, numeric(1), "global")
+sel_null <- sort(unlist(lapply(perm, `[[`, "sel")))
+
+glob_p <- (1 + sum(glob_null >= glob_obs)) / (diff_nperm + 1)
+cat(sprintf("Overall: mean squared z = %.3f (null mean %.3f) | %.1f%% of %d pairs with |z| > 1.96 | permutation p = %.3f\n",
+            glob_obs, mean(glob_null), 100 * mean(abs(z_obs[ut_all]) > 1.96, na.rm = TRUE),
+            sum(!is.na(z_obs[ut_all])), glob_p))
+
+## Per-edge p-values: fraction of shuffled selected edges with at least as large |z|.
+p_sel <- (1 + length(sel_null) - findInterval(abs(z_obs[sel_obs_ok]), sel_null, left.open = TRUE)) /
+  (length(sel_null) + 1)
+ij <- arrayInd(sel_obs_ok, dim(z_obs))
+diff_edges <- data.frame(from = colnames(coab_M)[ij[, 1]], to = colnames(coab_M)[ij[, 2]],
+                         z = z_obs[sel_obs_ok], p = p_sel, q = p.adjust(p_sel, "BH"))
+diff_edges$rho_IBD <- pair_cor(coab_M[is_ibd, ], grp_min_pairs)$r[sel_obs_ok]
+diff_edges$rho_nonIBD <- pair_cor(coab_M[!is_ibd, ], grp_min_pairs)$r[sel_obs_ok]
+diff_edges$symbol_1 <- sym_lookup[diff_edges$from]
+diff_edges$symbol_2 <- sym_lookup[diff_edges$to]
+
+cat(sprintf("Network edges tested: %d of %d (%d lack %d shared samples in the other group)\n",
+            nrow(diff_edges), length(sel_obs), length(sel_obs) - nrow(diff_edges), diff_min_n))
+cat(sprintf("Edges with p < 0.05: %d (about %d expected by chance) | BH q < 0.05: %d\n",
+            sum(diff_edges$p < 0.05), round(0.05 * nrow(diff_edges)), sum(diff_edges$q < 0.05)))
+
+knitr::kable(
+  diff_edges %>% arrange(p) %>% head(10) %>%
+    transmute(protein_1 = symbol_1, protein_2 = symbol_2, rho_IBD, rho_nonIBD, z, p, q),
+  digits = 3, row.names = FALSE,
+  caption = "The 10 network edges whose correlation differs most between IBD and non-IBD (z > 0: higher in IBD)")
+```
+
+```{r diff-coab-network, fig.width=10, fig.height=8}
+# Plots the union network with differential edges (red/blue) and candidate nodes (gold).
+## Union of both group networks with the shared layout. Light grey = no more
+## different than chance; red / blue = nominal p < 0.05 with a stronger
+## correlation in IBD / non-IBD. Gold nodes have at least one such edge.
+g_diff <- graph_from_data_frame(diff_edges[, c("from", "to", "z", "p")], directed = FALSE,
+                                vertices = data.frame(name = grp_nodes[grp_nodes %in% unique(c(diff_edges$from, diff_edges$to))]))
+is_d <- E(g_diff)$p < 0.05
+n_d <- table(factor(c(diff_edges$from[diff_edges$p < 0.05], diff_edges$to[diff_edges$p < 0.05]),
+                    levels = V(g_diff)$name))
+plot(g_diff, layout = lay_grp[match(V(g_diff)$name, grp_nodes), , drop = FALSE],
+     vertex.size = 3 + 3 * sqrt(as.numeric(n_d)),
+     vertex.color = ifelse(n_d > 0, "gold", "grey85"), vertex.frame.color = "white",
+     vertex.label = ifelse(n_d > 0, sym_lookup[V(g_diff)$name], NA),
+     vertex.label.cex = 0.75, vertex.label.color = "black", vertex.label.font = 2,
+     edge.color = ifelse(is_d, ifelse(E(g_diff)$z > 0, "firebrick", "steelblue"), "grey85"),
+     edge.width = ifelse(is_d, 2.5, 0.6))
+title("Differential co-abundance (red: stronger in IBD, blue: stronger in non-IBD, nominal p < 0.05)", cex.main = 0.9)
+```
+
+## Network candidates
+
+Candidates are the proteins with at least one nominally differential edge (p < 0.05), ranked by the number of such edges and then by the summed |z| of their edges, capped at 20.
+
+```{r candidates}
+# Ranks proteins by differential edges and keeps up to 20 as network candidates.
+prot_ids <- colnames(coab_M)
+inc <- function(v, f) sapply(prot_ids, function(p) f(v[diff_edges$from == p | diff_edges$to == p]))
+cand_tbl <- data.frame(protein = prot_ids, symbol = sym_lookup[prot_ids], stringsAsFactors = FALSE)
+cand_tbl$n_edges   <- inc(rep(1, nrow(diff_edges)), sum)
+cand_tbl$n_diff    <- inc(as.numeric(diff_edges$p < 0.05), sum)
+cand_tbl$sum_abs_z <- inc(abs(diff_edges$z), sum)
+
+candidates <- cand_tbl %>% filter(n_diff >= 1) %>%
+  arrange(desc(n_diff), desc(sum_abs_z)) %>% head(20)
+cat("Proteins with at least one nominally differential edge:", sum(cand_tbl$n_diff >= 1),
+    "| candidates kept:", nrow(candidates), "\n")
+knitr::kable(candidates %>% select(symbol, n_edges, n_diff, sum_abs_z), digits = 2, row.names = FALSE,
+             caption = "Network candidates: edges in the union network, differential edges and summed |z|")
+```
+
+# Functional mapping with STRING
+
+Two lists of proteins are sent to STRING together: the network candidates and the abundance candidates (|log2 fold change| > 0.5 in the proDA volcano plot); a protein can be on both. STRING (REST service, human proteins) returns the known and predicted interactions among them (score >= 0.4) and a functional enrichment test. The background is the set of all proteins detected in this study, not the whole genome. Symbols that STRING does not recognise are retried with their UniProt accession. This step needs an internet connection; if STRING cannot be reached the STRING chunks are skipped.
+
+```{r string-input}
+# Combines the network candidates and the abundance candidates into one protein list.
+da_hits <- volcano_df %>%
+  filter(sig_raw != "Not significant") %>%
+  transmute(protein, symbol = unname(sym_lookup[protein]),
+            da_dir = ifelse(sig_raw == "Significantly up", "up in IBD", "down in IBD"))
+
+## One row per gene symbol with its source(s)
+string_in <- full_join(
+  candidates %>% transmute(symbol, network = TRUE, acc_c = protein),
+  da_hits %>% select(symbol, acc_d = protein, da_dir), by = "symbol") %>%
+  filter(!is.na(symbol)) %>%
+  mutate(network = !is.na(network),
+         acc = sub(";.*$", "", coalesce(acc_c, acc_d)),     # accession, used if the symbol does not map
+         source = case_when(network & !is.na(da_dir) ~ "both",
+                            network ~ "network candidate",
+                            TRUE ~ "differential abundance")) %>%
+  distinct(symbol, .keep_all = TRUE)
+
+cat("Network candidates:", sum(string_in$network),
+    "| abundance candidates:", sum(!is.na(string_in$da_dir)),
+    "| in both:", sum(string_in$source == "both"),
+    "| combined list:", nrow(string_in), "\n")
+```
+
+```{r string-setup}
+# Maps the list and the background to STRING identifiers and retrieves interactions and enrichment.
+string_call <- function(endpoint, params) {
+  r <- httr::POST(paste0("https://string-db.org/api/json/", endpoint),
+            body = c(params, list(caller_identity = "ibd_stool_proteomics_course")),
+            encode = "form", httr::timeout(60))
+  httr::stop_for_status(r)
+  jsonlite::fromJSON(httr::content(r, as = "text", encoding = "UTF-8"))
+}
+collapse_ids <- function(x) paste(unique(x), collapse = "\r")
+
+map_ids <- function(sym, acc) {
+  m <- string_call("get_string_ids", list(identifiers = collapse_ids(sym), species = 9606, limit = 1))
+  miss <- !(sym %in% m$queryItem) & !is.na(acc)
+  if (any(miss)) {
+    m2 <- tryCatch(string_call("get_string_ids", list(identifiers = collapse_ids(acc[miss]), species = 9606, limit = 1)),
+                   error = function(e) NULL)
+    if (is.data.frame(m2) && nrow(m2) > 0) {
+      m2$queryItem <- sym[miss][match(m2$queryItem, acc[miss])]
+      m <- bind_rows(m, m2[, intersect(names(m2), names(m)), drop = FALSE])
+    }
+  }
+  m[!is.na(m$queryItem) & !duplicated(m$queryItem), ]
+}
+
+string_ok <- tryCatch({
+  bg_df <- data.frame(sym = unname(sym_lookup[colnames(coab_M)]), acc = sub(";.*$", "", colnames(coab_M))) %>%
+    filter(!is.na(sym)) %>% distinct(sym, .keep_all = TRUE)
+  map_c  <- map_ids(string_in$symbol, string_in$acc)             # the combined list
+  map_bg <- map_ids(bg_df$sym, bg_df$acc)                        # the background
+  string_net <- string_call("network", list(identifiers = collapse_ids(map_c$stringId), species = 9606,
+                                            required_score = 400))
+  string_enr <- string_call("enrichment", list(identifiers = collapse_ids(map_c$stringId), species = 9606,
+                                               background_string_identifiers = collapse_ids(map_bg$stringId)))
+  map_c <- map_c %>% left_join(string_in, by = c("queryItem" = "symbol"))
+  string_unmapped <- setdiff(string_in$symbol, map_c$queryItem)
+  cat("Proteins mapped to STRING:", nrow(map_c), "of", nrow(string_in),
+      if (length(string_unmapped)) paste0("(not found: ", paste(string_unmapped, collapse = ", "), ")"),
+      "| background proteins mapped:", nrow(map_bg), "of", nrow(bg_df), "\n")
+  TRUE
+}, error = function(e) {
+  cat("STRING could not be queried (", conditionMessage(e), "). Skipping the STRING steps.\n")
+  FALSE
+})
+```
+
+```{r string-network, fig.width=9, fig.height=7.5, eval=string_ok}
+# Draws the STRING interaction network and saves it as a 300 dpi image.
+## Node fill = abundance result (red = higher in IBD, blue = lower, grey = network
+## candidate without abundance change); thick outline = on both lists; node size =
+## STRING partners on the list; edge width = STRING score.
+vtx <- map_c[!duplicated(map_c$preferredName), ]
+e <- if (is.data.frame(string_net) && nrow(string_net) > 0) {
+  x <- unique(string_net[, c("preferredName_A", "preferredName_B", "score")])
+  x[!duplicated(paste(pmin(x$preferredName_A, x$preferredName_B),
+                      pmax(x$preferredName_A, x$preferredName_B))), ]
+} else NULL
+g_s <- graph_from_data_frame(
+  if (is.null(e)) data.frame(a = character(), b = character(), score = numeric()) else e,
+  directed = FALSE, vertices = data.frame(name = vtx$preferredName))
+v_s <- vtx[match(V(g_s)$name, vtx$preferredName), ]
+src <- setNames(vtx$source, vtx$preferredName)
+
+col_up <- "#e34948"; col_down <- "#2a78d6"; col_none <- "#a8a7a0"
+ends_s <- if (ecount(g_s) > 0) ends(g_s, E(g_s)) else matrix(character(), 0, 2)
+is_cross <- (src[ends_s[, 1]] == "differential abundance" & src[ends_s[, 2]] == "network candidate") |
+            (src[ends_s[, 1]] == "network candidate" & src[ends_s[, 2]] == "differential abundance")
+
+draw_string_fig <- function() {
+  deg <- degree(g_s)
+  fill <- ifelse(is.na(v_s$da_dir), col_none, ifelse(v_s$da_dir == "up in IBD", col_up, col_down))
+  set.seed(params$seed)
+  lay <- layout_with_fr(g_s, weights = E(g_s)$score, niter = 3000)
+  op <- par(mar = c(1, 1, 3.5, 1), family = "sans"); on.exit(par(op))
+  vsize <- pmin(11 + 2.5 * deg, 32)
+  plot(g_s, layout = lay, xlim = c(-1.05, 1.05), ylim = c(-1.55, 1.05),   # room under the network for the legend
+       vertex.size = vsize, vertex.color = fill,
+       vertex.frame.color = ifelse(v_s$source == "both", "#0b0b0b", "white"),
+       vertex.frame.width = ifelse(v_s$source == "both", 3.5, 1.5),
+       vertex.label.cex = 0.95, vertex.label.font = 2, vertex.label.color = "#0b0b0b",
+       vertex.label.family = "sans", vertex.label.dist = 0.75 + vsize / 14, vertex.label.degree = -pi / 2,
+       edge.width = if (length(is_cross)) 1 + 6 * (E(g_s)$score - 0.4) / 0.6 else 1,
+       edge.color = "#b4b3ab")
+  title("STRING network of the network candidates and the differentially abundant proteins",
+        cex.main = 1, adj = 0)
+  mtext(sprintf("%d proteins mapped | %d interactions (STRING score >= 0.4) | node size = partners | edge width = STRING score",
+                vcount(g_s), ecount(g_s)), side = 3, line = 0.3, adj = 0, cex = 0.8, col = "#52514e")
+  if (length(string_unmapped))
+    mtext(paste("Not found in STRING (not drawn):", paste(string_unmapped, collapse = ", ")),
+          side = 3, line = -0.7, adj = 0, cex = 0.75, col = "#52514e")
+  legend("bottomleft", bty = "n", cex = 0.85, ncol = 1,
+         legend = c("higher in IBD (abundance)", "lower in IBD (abundance)",
+                    "network candidate, no abundance change", "thick outline: on both lists"),
+         pch = 21, pt.cex = 1.8, pt.lwd = c(1, 1, 1, 3.5),
+         pt.bg = c(col_up, col_down, col_none, "white"),
+         col = c("white", "white", "white", "#0b0b0b"))
+}
+draw_string_fig()
+
+## also saved as a 300 dpi image for the report and slides
+dir.create("figure", showWarnings = FALSE)
+png("figure/string_network_final.png", width = 2700, height = 2250, res = 300)
+draw_string_fig(); invisible(dev.off())
+```
+
+```{r string-stats, eval=string_ok}
+# Network statistics, hubs, modules and cross-list links of the STRING network, plus enrichment.
+n_node <- vcount(g_s); n_edge <- ecount(g_s)
+comp <- components(g_s)
+set.seed(params$seed)
+louv <- if (n_edge > 0) cluster_louvain(g_s, weights = E(g_s)$score) else NULL
+cat(sprintf("Nodes: %d | edges: %d | density: %.2f | mean partners: %.1f | mean STRING score: %.2f\n",
+            n_node, n_edge, edge_density(g_s), mean(degree(g_s)), if (n_edge > 0) mean(E(g_s)$score) else NA))
+cat(sprintf("Connected components: %d (largest has %d proteins) | modules (Louvain): %d | modularity: %.2f\n",
+            comp$no, max(comp$csize), if (is.null(louv)) 0 else length(louv),
+            if (is.null(louv)) NA else modularity(louv)))
+
+hub_tbl <- data.frame(
+  protein = V(g_s)$name, source = src[V(g_s)$name], partners = degree(g_s),
+  weighted = round(strength(g_s, weights = E(g_s)$score), 2),
+  betweenness = round(betweenness(g_s, weights = 1 - E(g_s)$score + 0.01), 1),
+  module = if (is.null(louv)) NA else as.integer(membership(louv))) %>%
+  arrange(desc(partners), desc(weighted))
+knitr::kable(hub_tbl, row.names = FALSE,
+             caption = "Proteins in the STRING network: partners on the list, summed STRING score, betweenness, and module")
+
+if (!is.null(louv))
+  knitr::kable(hub_tbl %>% group_by(module) %>%
+                 summarise(size = n(), proteins = paste(protein, collapse = ", "), .groups = "drop"),
+               caption = "Modules of the STRING network (Louvain on the STRING score)")
+
+if (any(is_cross))
+  knitr::kable(data.frame(
+    abundance_protein = ifelse(src[ends_s[is_cross, 1]] == "differential abundance", ends_s[is_cross, 1], ends_s[is_cross, 2]),
+    network_candidate = ifelse(src[ends_s[is_cross, 1]] == "differential abundance", ends_s[is_cross, 2], ends_s[is_cross, 1]),
+    score = E(g_s)$score[is_cross]) %>% arrange(desc(score)), digits = 3, row.names = FALSE,
+    caption = "Links between an abundance-only protein and a network-only protein (sorted by STRING score)")
+
+if (is.data.frame(string_enr) && nrow(string_enr) > 0) {
+  enr <- string_enr %>% mutate(fdr = as.numeric(fdr)) %>%
+    filter(category %in% c("Process", "KEGG", "RCTR", "WikiPathways"))
+  cat("Enriched terms at FDR < 0.05:", sum(enr$fdr < 0.05), "of", nrow(enr), "terms tested\n")
+} else cat("STRING returned no enrichment results.\n")
+```
+
+# Software
+
+```{r software}
+# Prints the R and package versions used.
+sessionInfo()
+```
